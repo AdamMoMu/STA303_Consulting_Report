@@ -1,0 +1,153 @@
+---
+title: "Data preparation"
+output:
+  pdf_document: default
+---
+
+# Instructions
+
+- You only need to submit the .Rmd of this file, not a PDF.
+
+- You should __comment__ your code clearly to show what you've done to prepare the data.
+
+- The purpose of this file is to use the data in the `data-raw` folder to create the data you will use in the report. The data you will use in the report should be saved in the `data` folder. It is good professional practice to make sure you're never directly modifying your raw data, but instead creating new datasets based on merges/manipulations that you need to reuse.
+
+- Make sure you've taken a look at the hints for the web scraping and census API. 
+
+- You may find the `write_rds()` function from the `readr` package helpful (it is loaded as part of the `tidyverse`).
+
+- You do not need to keep the structure below.
+
+# Set up
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(rvest)
+library(polite)
+library(haven)
+library(cancensus)
+```
+
+# Loading client data
+
+```{r}
+# Load all raw data
+mingar_device_data = read_rds("data-raw/device.Rds")
+customer_data = read_rds("data-raw/customer.Rds")
+sleep_data = read_rds("data-raw/cust_sleep.Rds")
+cust_dev_data = read_rds("data-raw/cust_dev.Rds")
+```
+
+# Getting external data
+
+## Web scraping industry data
+
+```{r Scraping}
+url <- "https://fitnesstrackerinfohub.netlify.app/"
+
+# Check if we are allowed to scrape data
+target <- bow(url,
+              user_agent = "adamm.musa@mail.utoronto.ca for STA303/1002 project",
+              force = TRUE)
+
+# Any details provided in the robots text on crawl delays and 
+# which agents are allowed to scrape
+target
+
+# Get website data
+html <- scrape(target)
+
+# Filter data to only the needed table
+device_data <- html %>% 
+  html_elements("table") %>% 
+  html_table() %>% 
+  pluck(1) %>% 
+  janitor::clean_names() # clean column names
+```
+
+## Postal Code Conversion File
+```{r PCCF}
+# dataset = read_sav("data-raw/pccfNat_fccpNat_082021sav.sav")
+
+# Keep only needed information
+# postcode <- dataset %>% 
+#  select(PC, CSDuid)
+
+# Read in PCCF data
+postcode <- read_rds("data-raw/break_glass_in_case_of_emergency.Rds")
+```
+
+## Census API
+
+```{r Census}
+# Set up api data
+options(cancensus.api_key = "CensusMapper_4085db21aef33e8ae9c3ce0426e411e1",
+        cancensus.cache_path = "cache")
+
+
+# get all regions as at the 2016 Census 
+regions <- list_census_regions(dataset = "CA16")
+
+# Select necessary regions
+regions_filtered <-  regions %>% 
+  filter(level == "CSD") %>% # Census Subdivision
+  as_census_region_list()
+
+# Get household median income
+census_data_csd <- get_census(dataset='CA16', regions = regions_filtered,
+                          vectors=c("v_CA16_2397"), 
+                          level='CSD', geo_format = "sf")
+
+# Simplify to only needed variables
+median_income <- census_data_csd %>% 
+  as_tibble() %>% 
+  select(CSDuid = GeoUID, contains("median"), Population) %>% 
+  mutate(CSDuid = parse_number(CSDuid)) %>% 
+  rename(hhld_median_inc = 2)
+```
+
+# Formatting Data
+## Marketing Data
+```{r marketing}
+# Joining income data with postcodes and rename col to 'postcode'
+income_data <- median_income %>% 
+  left_join(postcode, by="CSDuid") 
+colnames(income_data)[4] = "postcode"
+
+# Join Customer data with Avg Income in their area
+market_data = customer_data %>% 
+  left_join(income_data, by="postcode")
+
+# Join Mingar Device data with specifications and rest of data
+market_data = market_data %>% 
+  left_join(cust_dev_data, by = "cust_id") %>% 
+  left_join(mingar_device_data, by = 'dev_id') %>% 
+  distinct(cust_id, .keep_all = TRUE) %>% 
+  select(-c("postcode", "CSDuid", "Population","dev_id", "device_name", "released"))    # Remove unneeded columns
+
+# Save data
+write_rds(market_data, "data/cust_device.Rds")
+```
+
+## Social Media Data
+```{r social}
+# Join cust data with Mingar Device data and device features
+social_data = customer_data %>% 
+  left_join(cust_dev_data, by = "cust_id") %>% 
+  left_join(mingar_device_data, by = 'dev_id') %>% 
+  left_join(device_data, by= c("device_name", "line"))
+
+# Join social data with sleep data
+social_data = social_data %>% 
+  right_join(sleep_data, by = "cust_id") %>% 
+  select(c("cust_id", "dob", "sex", "pronouns", "emoji_modifier", "device_name", "released.x", "recommended_retail_price", "date", "duration", "flags"))  # Remove unneeded columns
+
+# Change column names
+colnames(social_data)[7] = "released" 
+
+# Remove any rows with NA
+social_data = na.omit(social_data)
+
+# Save data
+write_rds(social_data, "data/cust_sleep.Rds")
+```
